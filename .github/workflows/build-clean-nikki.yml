@@ -1,0 +1,145 @@
+name: Build Clean Nikki Firmware
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  OPENWRT_VERSION: v25.12.6
+  OPENWRT_DIR: ${{ github.workspace }}/openwrt
+
+jobs:
+  build:
+    name: clean-nikki
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3-setuptools rsync swig unzip zlib1g-dev file wget curl ccache jq
+          sudo mkdir -p /work
+          sudo chown $USER:$GROUP /work
+
+      - name: Clone OpenWrt
+        run: |
+          df -hT $PWD
+          git clone --depth 1 -b "$OPENWRT_VERSION" https://github.com/openwrt/openwrt.git "$OPENWRT_DIR"
+
+      - name: Apply AN8855 target
+        run: |
+          cd "$OPENWRT_DIR"
+          cp "$GITHUB_WORKSPACE/patches/mt7981b-xiaomi-mi-router-ax3000t-an8855.dts" target/linux/mediatek/dts/
+          patch -p1 --forward --no-backup-if-mismatch --fuzz=0 \
+            -i "$GITHUB_WORKSPACE/patches/0001-add-an8855-target.patch" \
+            || patch -p1 --forward --no-backup-if-mismatch \
+            -i "$GITHUB_WORKSPACE/patches/0001-add-an8855-target.patch"
+          grep -q 'Device/xiaomi_mi-router-ax3000t-an8855' target/linux/mediatek/image/filogic.mk
+          grep -q 'xiaomi,mi-router-ax3000t-an8855' target/linux/mediatek/filogic/base-files/lib/upgrade/platform.sh
+
+      - name: Add Nikki feed
+        run: |
+          cd "$OPENWRT_DIR"
+          cp feeds.conf.default feeds.conf
+          printf '\nsrc-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main\n' >> feeds.conf
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          ./scripts/feeds install -f -p nikki nikki luci-app-nikki mihomo-meta
+          ./scripts/feeds install luci-i18n-nikki-zh-cn || true
+
+      - name: Minimal config
+        run: |
+          cd "$OPENWRT_DIR"
+          cat > .config <<'EOF'
+          CONFIG_TARGET_mediatek=y
+          CONFIG_TARGET_mediatek_filogic=y
+          CONFIG_TARGET_mediatek_filogic_DEVICE_xiaomi_mi-router-ax3000t-an8855=y
+          # CONFIG_TARGET_MULTI_PROFILE is not set
+
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-ssl=y
+          CONFIG_LUCI_LANG_zh_Hans=y
+          CONFIG_PACKAGE_luci-app-firewall=y
+
+          CONFIG_PACKAGE_nikki=y
+          CONFIG_PACKAGE_luci-app-nikki=y
+          CONFIG_PACKAGE_luci-i18n-nikki-zh-cn=y
+          CONFIG_PACKAGE_mihomo-meta=y
+          # CONFIG_PACKAGE_mihomo-alpha is not set
+          CONFIG_PACKAGE_yq=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_ca-bundle=y
+          CONFIG_PACKAGE_firewall4=y
+
+          CONFIG_PACKAGE_kmod-inet-diag=y
+          CONFIG_PACKAGE_kmod-dummy=y
+          CONFIG_PACKAGE_kmod-nft-socket=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_kmod-tun=y
+          EOF
+          make defconfig
+          echo '--- target ---'
+          grep -E '^CONFIG_TARGET_mediatek_filogic_DEVICE' .config
+          echo '--- nikki ---'
+          grep -E '^CONFIG_PACKAGE_(nikki|luci-app-nikki|luci-i18n-nikki-zh-cn|mihomo-meta|yq)=' .config
+          grep -q 'CONFIG_TARGET_mediatek_filogic_DEVICE_xiaomi_mi-router-ax3000t-an8855=y' .config
+          grep -q 'CONFIG_PACKAGE_luci-app-nikki=y' .config
+
+      - name: Download packages
+        run: cd "$OPENWRT_DIR" && make download -j8
+
+      - name: Compile
+        run: |
+          cd "$OPENWRT_DIR"
+          echo "$(nproc) threads"
+          make -j$(nproc) V=s || make -j1 V=s
+
+      - name: Collect artifacts
+        if: success()
+        run: |
+          mkdir -p out
+          cp "$OPENWRT_DIR"/bin/targets/mediatek/filogic/*.bin out/ || true
+          cp "$OPENWRT_DIR"/bin/targets/mediatek/filogic/*.manifest out/ || true
+          cp "$OPENWRT_DIR"/bin/targets/mediatek/filogic/config.buildinfo out/ 2>/dev/null || true
+          cp "$OPENWRT_DIR"/bin/targets/mediatek/filogic/feeds.buildinfo out/ 2>/dev/null || true
+          ls -lh out
+          (cd out && sha256sum * > SHA256SUMS.txt)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clean-nikki-${{ github.run_number }}
+          path: out/*
+          if-no-files-found: error
+
+      - name: Publish release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: clean-nikki-${{ github.run_number }}
+          name: Clean Nikki ${{ github.run_number }}
+          body: |
+            OpenWrt ${{ env.OPENWRT_VERSION }} + AN8855 target + Nikki (mihomo-meta).
+            Minimal package set: LuCI (zh-CN), luci-app-firewall, Nikki stack, required kernel modules.
+            No Tailscale, no Argon, no xinfc, no extra diagnostics.
+          files: out/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
